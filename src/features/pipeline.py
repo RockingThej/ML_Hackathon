@@ -10,6 +10,12 @@ Processes all 80 train trips and 10 student_test trips, generating:
 
 import os
 import sys
+
+# Ensure repository root is in sys.path
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import time
 from typing import List, Dict, Any, Tuple
 import numpy as np
@@ -30,6 +36,11 @@ def run_pipeline(
     """
     Execute full feature pipeline and save all contract artifacts.
     """
+    if not os.path.isabs(data_dir):
+        data_dir = os.path.join(_ROOT, data_dir)
+    if not os.path.isabs(output_dir):
+        output_dir = os.path.join(_ROOT, output_dir)
+
     os.makedirs(output_dir, exist_ok=True)
     t_start = time.time()
 

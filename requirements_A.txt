@@ -1,0 +1,12 @@
+numpy
+pandas
+pyarrow
+scipy
+shapely
+pyproj
+scikit-learn
+joblib
+folium
+matplotlib
+nbformat
+jupyter
