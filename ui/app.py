@@ -86,7 +86,8 @@ def get_arc_geometry(base, trip_id, arc_ids: tuple):
     return {}, "none"
 
 
-def build_map(track: pd.DataFrame, route_coords: list, show_points: bool):
+def build_map(track: pd.DataFrame, routes: dict, show_points: bool):
+    """routes: {layer name: (colour, [[lat, lon], [lat, lon]] segments)}"""
     center = [track["lat"].mean(), track["lon"].mean()]
     m = folium.Map(location=center, zoom_start=14, tiles="cartodbpositron", control_scale=True)
     gps = folium.FeatureGroup("Raw GPS trace")
@@ -98,10 +99,12 @@ def build_map(track: pd.DataFrame, route_coords: list, show_points: bool):
             folium.CircleMarker([p.lat, p.lon], radius=2, color="#2a78d6",
                                 fill=True, fill_opacity=0.8, weight=0).add_to(gps)
     gps.add_to(m)
-    if route_coords:
-        rt = folium.FeatureGroup("Matched route (model)")
-        for seg in route_coords:
-            folium.PolyLine(seg, color="#eb6834", weight=5, opacity=0.9).add_to(rt)
+    for name, (colour, segs) in routes.items():
+        if not segs:
+            continue
+        rt = folium.FeatureGroup(name)
+        for seg in segs:
+            folium.PolyLine(seg, color=colour, weight=5, opacity=0.85, tooltip=name).add_to(rt)
         rt.add_to(m)
     folium.Marker(track[["lat", "lon"]].iloc[0].tolist(), tooltip="Start",
                   icon=folium.Icon(color="green", icon="play")).add_to(m)
@@ -143,39 +146,61 @@ with tab_match:
         ids = trips.get(f"{group}_trips", [])
         trip_id = c2.selectbox("Trip ID", ids) if ids else None
         top_k = c3.slider("Candidates per point (K)", 5, 30, 15)
-        show_points = st.checkbox("Show individual GPS points", value=True)
+        o1, o2 = st.columns(2)
+        use_hmm = o1.checkbox("Also run HMM (Viterbi) route reconstruction", value=True,
+                              help="Classifier picks each point independently; the HMM also "
+                                   "enforces that consecutive arcs are connected on the road graph.")
+        show_points = o2.checkbox("Show individual GPS points", value=True)
 
         if trip_id is not None and st.button("Run map matching", type="primary"):
             with st.spinner(f"Matching trip {trip_id} ..."):
                 try:
-                    pred = api_post(api, "/predict", {"trip_id": int(trip_id), "top_k": int(top_k)})
+                    pred = api_post(api, "/predict", {"trip_id": int(trip_id), "top_k": int(top_k),
+                                                    "use_hmm": bool(use_hmm)})
                     st.session_state["pred"] = pred
                 except requests.HTTPError as e:
                     st.error(f"/predict failed: {e.response.text[:400]}")
 
         pred = st.session_state.get("pred")
         if pred and trip_id is not None and pred["trip_id"] == trip_id:
-            m1, m2, m3, m4 = st.columns(4)
             met = pred.get("metrics") or {}
-            m1.metric("Point accuracy", f"{met['point_accuracy']:.1%}" if met else "n/a")
-            m2.metric("Miss-rate", f"{met['candidate_miss_rate']:.1%}" if met else "n/a",
-                      help="Fraction of GPS points matched to the wrong arc (lower is better)")
+            hmet = pred.get("hmm_metrics") or {}
+            hmm_route = pred.get("hmm_route") or []
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Classifier accuracy", f"{met['point_accuracy']:.1%}" if met else "n/a")
+            if hmet:
+                delta = (hmet["point_accuracy"] - met["point_accuracy"]) if met else None
+                m2.metric("HMM accuracy", f"{hmet['point_accuracy']:.1%}",
+                          delta=f"{delta:+.1%} vs classifier" if delta is not None else None)
+            else:
+                m2.metric("HMM accuracy", "n/a" if not hmm_route else "no ground truth")
             m3.metric("GPS points", f"{pred['n_points']:,}")
             m4.metric("Latency", f"{pred['inference_time_ms']:.0f} ms")
+            if use_hmm and not hmm_route:
+                st.warning("HMM route not returned - check the API log on Laptop 1 "
+                           "('HMM decoding failed ...').")
             st.caption(f"Model: **{pred['model_name']}**"
                        + ("" if met else " · no route file for this trip, so no accuracy"))
 
             track = get_track(api, trip_id)
             visits = collapse(pred["predicted_route"])
-            geom, src = get_arc_geometry(api, trip_id, tuple(sorted(set(visits))))
-            route_coords = [geom[a] for a in visits if a in geom]
+            hmm_visits = collapse(hmm_route)
+            geom, src = get_arc_geometry(api, trip_id, tuple(sorted(set(visits) | set(hmm_visits))))
+            routes = {"Classifier route (per point)": ("#eb6834", [geom[a] for a in visits if a in geom])}
+            if hmm_visits:
+                routes["HMM route (Viterbi)"] = ("#1baf7a", [geom[a] for a in hmm_visits if a in geom])
             if src == "none":
                 st.warning("Route geometry unavailable: ask C to add POST /trips/{id}/arcs "
                            "(snippet in docs/D_notes_for_team.md). Showing GPS only.")
-            st_folium(build_map(track, route_coords, show_points), height=600,
+            st_folium(build_map(track, routes, show_points), height=600,
                       use_container_width=True, returned_objects=[])
-            with st.expander(f"Matched arcs in travel order ({len(visits)} visits)"):
-                st.write(visits)
+            st.caption("Dashed blue = raw GPS · orange = classifier's top candidate per point · "
+                       "green = HMM route. Toggle layers with the control on the map.")
+            with st.expander(f"Matched arcs in travel order ({len(visits)} classifier / "
+                             f"{len(hmm_visits)} HMM visits)"):
+                c_a, c_b = st.columns(2)
+                c_a.write(visits)
+                c_b.write(hmm_visits)
 
 # ---------------------------------------------------------------------------
 # Tab 2 - model comparison

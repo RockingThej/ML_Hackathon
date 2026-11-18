@@ -266,18 +266,20 @@ def predict(req: PredictRequest):
     if req.use_hmm:
         try:
             from src.hmm.matcher import match_trip
-            result_df, _, _ = match_trip(str(trip_root), trip_id, K=req.top_k)
+            result_df, _, _ = match_trip(str(trip_root), trip_id, K=req.top_k, model=model)
             hmm_route = result_df["predicted_arc_id"].tolist()
-            if has_route and trip.get("route") is not None:
-                true_route = trip["route"]
-                min_len = min(len(hmm_route), len(true_route))
-                if min_len > 0:
-                    matches = sum(p == t for p, t in zip(hmm_route[:min_len], true_route[:min_len]))
-                    h_acc = matches / min_len
+            if has_route and "true_arc" in df_feats.attrs:
+                true_arcs = df_feats.attrs["true_arc"]
+                true_dists = df_feats.attrs.get("true_dist", np.zeros(len(true_arcs)))
+                valid = (true_dists <= 50.0) & (np.arange(len(true_arcs)) < len(hmm_route))
+                if valid.sum() > 0:
+                    hmm_arr = np.array(hmm_route)
+                    correct = (hmm_arr[valid] == true_arcs[valid]).sum()
+                    h_acc = float(correct / valid.sum())
                     hmm_metric_summary = MetricSummary(
                         point_accuracy=round(h_acc, 4),
                         candidate_miss_rate=round(1.0 - h_acc, 4),
-                        n_evaluated_points=min_len,
+                        n_evaluated_points=int(valid.sum()),
                     )
         except Exception as e:
             logger.warning("HMM decoding failed for trip %d: %s", trip_id, e)

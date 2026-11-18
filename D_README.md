@@ -1,6 +1,6 @@
 # Part D: neural net, GPU trees, Bayesian tuning, UI
 
-Owner: D (RTX 4050, 6 GB) · branch `d-models`
+Owner: D (RTX 3050, 6 GB) · branch `d-models`
 
 ## What's in this folder
 
@@ -17,7 +17,7 @@ Owner: D (RTX 4050, 6 GB) · branch `d-models`
 
 Every script writes its row to `results/model_comparison.csv` using **C's columns and C's miss-rate definition**, so the leaderboard stays comparable.
 
-## Setup (RTX 4050 laptop)
+## Setup (RTX 3050 laptop)
 
 ```bash
 git checkout -b d-models          # or: git checkout d-models

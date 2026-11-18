@@ -72,3 +72,34 @@ df["point_prob"] = m.point_proba(df[FEATURES].to_numpy(), k=15)   # MLP only
 
 ## Metric definition used by D
 D uses C's definition: **miss-rate** is the fraction of labelled GPS points whose top-scored candidate is not the true arc. If the true arc wasn't among the 15 candidates, that point counts as a miss. This keeps D's rows in `results/model_comparison.csv` directly comparable with C's.
+
+---
+
+## Update after merging A + B + C (18 Nov)
+
+### For C: HMM accuracy in `/predict`: ✅ fixed (commit `a19f42e`)
+The HMM is now scored against the per-point true arc, on the same points as the classifier (true arc within 50 m), so the UI's classifier-vs-HMM comparison is fair.
+
+### For B: the HMM doesn't use the trained classifier yet
+`build_emission_log_probs` in `src/hmm/matcher.py` uses hand-tuned distance and bearing Gaussians. That's a fine baseline, but the plan's comparison is **classifier-only vs. classifier + HMM**. To make the HMM use the model, add this and pass the result to `viterbi_decode_variable` in place of the hand-made emissions:
+
+```python
+import joblib
+from src.features.candidates import FEATURES
+
+def build_emission_log_probs_from_model(features, model, K=15):
+    """Emission = log P(candidate is true arc), normalised over the point's K candidates."""
+    f = features.sort_values(["point_idx", "dist_rank"])
+    p = model.predict_proba(f[FEATURES].to_numpy("float32"))[:, 1].reshape(-1, K)
+    p = np.clip(p, 1e-6, None)
+    p = p / p.sum(1, keepdims=True)
+    return list(np.log(p))
+
+# in match_trip(..., model_path="artifacts/best_model.joblib"):
+#   model = joblib.load(model_path)
+#   emissions = build_emission_log_probs_from_model(features, model, K=K)
+```
+The row order matches the `grouped` list `match_trip` already builds (sorted by `point_idx`, then `dist_rank`), so the decoded indices still map to the right arcs. Report three numbers: classifier-only, HMM with hand-made emissions, and HMM with model emissions.
+
+### UI (D)
+`ui/app.py` now sends `use_hmm`, shows the classifier and HMM accuracy side by side, and draws both routes as map layers (orange = classifier, green = HMM).
