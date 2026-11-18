@@ -86,8 +86,9 @@ async def log_requests(request: Request, call_next):
 # Paths and model cache
 # ---------------------------------------------------------------------------
 DATA_DIR = PROJECT_ROOT / "data" / "raw"
-DATA_TRAIN = DATA_DIR / "train"
+DATA_EVAL = DATA_DIR / "evaluator_test"
 DATA_TEST = DATA_DIR / "student_test"
+DATA_TRAIN = DATA_DIR / "train"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 
 _loaded_model: Any = None
@@ -161,8 +162,20 @@ class PredictResponse(BaseModel):
 
 
 class TripListResponse(BaseModel):
-    student_test_trips: List[int]
-    train_trips: List[int]
+    evaluator_test_trips: List[int] = Field(default_factory=list)
+    student_test_trips: List[int] = Field(default_factory=list)
+    train_trips: List[int] = Field(default_factory=list)
+
+
+def _find_trip_root(trip_id: int) -> Path:
+    """Find which data folder contains the given trip_id."""
+    for folder in [DATA_EVAL, DATA_TEST, DATA_TRAIN]:
+        if folder.exists() and (folder / f"{trip_id:08d}").exists():
+            return folder
+    raise HTTPException(
+        status_code=404,
+        detail=f"Trip {trip_id} not found in evaluator_test, student_test, or train datasets.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -174,17 +187,23 @@ def health():
     return {
         "status": "healthy",
         "model_loaded": model_name,
-        "train_trips_available": len(list_trips(DATA_TRAIN)) if DATA_TRAIN.exists() else 0,
+        "eval_trips_available": len(list_trips(DATA_EVAL)) if DATA_EVAL.exists() else 0,
         "test_trips_available": len(list_trips(DATA_TEST)) if DATA_TEST.exists() else 0,
+        "train_trips_available": len(list_trips(DATA_TRAIN)) if DATA_TRAIN.exists() else 0,
     }
 
 
 @app.get("/trips", response_model=TripListResponse)
 def get_trips():
-    """List available evaluation (student_test) and training trips."""
-    train = list_trips(DATA_TRAIN) if DATA_TRAIN.exists() else []
+    """List available trips across evaluator_test, student_test, and train."""
+    eval_trips = list_trips(DATA_EVAL) if DATA_EVAL.exists() else []
     test = list_trips(DATA_TEST) if DATA_TEST.exists() else []
-    return TripListResponse(student_test_trips=test, train_trips=train)
+    train = list_trips(DATA_TRAIN) if DATA_TRAIN.exists() else []
+    return TripListResponse(
+        evaluator_test_trips=eval_trips,
+        student_test_trips=test,
+        train_trips=train,
+    )
 
 
 @app.post("/predict", response_model=PredictResponse)
@@ -197,13 +216,7 @@ def predict(req: PredictRequest):
     t0 = time.perf_counter()
 
     # Determine data directory
-    trip_root = None
-    if DATA_TEST.exists() and (DATA_TEST / f"{trip_id:08d}").exists():
-        trip_root = DATA_TEST
-    elif DATA_TRAIN.exists() and (DATA_TRAIN / f"{trip_id:08d}").exists():
-        trip_root = DATA_TRAIN
-    else:
-        raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found in train or student_test datasets.")
+    trip_root = _find_trip_root(trip_id)
 
     try:
         trip = load_trip(trip_root, trip_id)
@@ -301,9 +314,7 @@ def predict(req: PredictRequest):
 @app.post("/trips/{trip_id}/arcs")
 def get_arcs(trip_id: int, req: ArcRequest):
     """Lat/lon endpoints of the requested arcs (for drawing the matched route on Laptop 2)."""
-    root = DATA_TEST if (DATA_TEST / f"{trip_id:08d}").exists() else DATA_TRAIN
-    if not (root / f"{trip_id:08d}").exists():
-        raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found")
+    root = _find_trip_root(trip_id)
     trip = load_trip(root, trip_id)
     nodes, arcs = trip["nodes"], trip["arcs"]  # nodes: lon, lat
     out = []
@@ -323,10 +334,7 @@ def get_arcs(trip_id: int, req: ArcRequest):
 @app.get("/trips/{trip_id}/track")
 def get_track(trip_id: int):
     """Return raw GPS trajectory points for the map view."""
-    root = DATA_TEST if (DATA_TEST / f"{trip_id:08d}").exists() else DATA_TRAIN
-    if not (root / f"{trip_id:08d}").exists():
-        raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found")
-
+    root = _find_trip_root(trip_id)
     trip = load_trip(root, trip_id)
     track = trip["track"]  # lon, lat, timestamp
     return {

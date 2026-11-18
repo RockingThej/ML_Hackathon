@@ -142,7 +142,11 @@ with tab_match:
     else:
         trips = get_trips(api)
         c1, c2, c3 = st.columns([2, 1, 1])
-        group = c1.radio("Trip set", ["student_test", "train"], horizontal=True)
+        options = []
+        if trips.get("evaluator_test_trips"):
+            options.append("evaluator_test")
+        options.extend(["student_test", "train"])
+        group = c1.radio("Trip set", options, horizontal=True)
         ids = trips.get(f"{group}_trips", [])
         trip_id = c2.selectbox("Trip ID", ids) if ids else None
         top_k = c3.slider("Candidates per point (K)", 5, 30, 15)
