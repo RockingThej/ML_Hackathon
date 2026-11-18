@@ -19,6 +19,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -87,7 +88,8 @@ async def log_requests(request: Request, call_next):
 # ---------------------------------------------------------------------------
 DATA_DIR = PROJECT_ROOT / "data" / "raw"
 DATA_EVAL = DATA_DIR / "evaluator_test"
-DATA_TEST = DATA_DIR / "student_test"
+TEST_SET = os.environ.get("PATHSNAP_TEST_SET", "student_test")
+DATA_TEST = DATA_DIR / TEST_SET
 DATA_TRAIN = DATA_DIR / "train"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 
@@ -162,19 +164,21 @@ class PredictResponse(BaseModel):
 
 
 class TripListResponse(BaseModel):
+    test_set: str = Field("student_test", description="Name of the test folder being served")
     evaluator_test_trips: List[int] = Field(default_factory=list)
     student_test_trips: List[int] = Field(default_factory=list)
+    test_trips: List[int] = Field(default_factory=list)
     train_trips: List[int] = Field(default_factory=list)
 
 
 def _find_trip_root(trip_id: int) -> Path:
     """Find which data folder contains the given trip_id."""
-    for folder in [DATA_EVAL, DATA_TEST, DATA_TRAIN]:
+    for folder in [DATA_EVAL, DATA_TEST, DATA_DIR / "student_test", DATA_TRAIN]:
         if folder.exists() and (folder / f"{trip_id:08d}").exists():
             return folder
     raise HTTPException(
         status_code=404,
-        detail=f"Trip {trip_id} not found in evaluator_test, student_test, or train datasets.",
+        detail=f"Trip {trip_id} not found in evaluator_test, {TEST_SET}, or train datasets.",
     )
 
 
@@ -187,6 +191,7 @@ def health():
     return {
         "status": "healthy",
         "model_loaded": model_name,
+        "test_set": TEST_SET,
         "eval_trips_available": len(list_trips(DATA_EVAL)) if DATA_EVAL.exists() else 0,
         "test_trips_available": len(list_trips(DATA_TEST)) if DATA_TEST.exists() else 0,
         "train_trips_available": len(list_trips(DATA_TRAIN)) if DATA_TRAIN.exists() else 0,
@@ -197,11 +202,14 @@ def health():
 def get_trips():
     """List available trips across evaluator_test, student_test, and train."""
     eval_trips = list_trips(DATA_EVAL) if DATA_EVAL.exists() else []
+    student_test = list_trips(DATA_DIR / "student_test") if (DATA_DIR / "student_test").exists() else []
     test = list_trips(DATA_TEST) if DATA_TEST.exists() else []
     train = list_trips(DATA_TRAIN) if DATA_TRAIN.exists() else []
     return TripListResponse(
+        test_set=TEST_SET,
         evaluator_test_trips=eval_trips,
-        student_test_trips=test,
+        student_test_trips=student_test,
+        test_trips=test,
         train_trips=train,
     )
 

@@ -74,7 +74,7 @@ def get_arc_geometry(base, trip_id, arc_ids: tuple):
         pass
     try:
         from src.data.loaders import load_arcs, load_nodes
-        for part in ["student_test", "train"]:
+        for part in ["evaluator_test", "student_test", "train"]:
             root = ROOT / "data" / "raw" / part
             if (root / f"{trip_id:08d}").exists():
                 nodes, arcs = load_nodes(root, trip_id), load_arcs(root, trip_id)
@@ -89,7 +89,7 @@ def get_arc_geometry(base, trip_id, arc_ids: tuple):
 def build_map(track: pd.DataFrame, routes: dict, show_points: bool):
     """routes: {layer name: (colour, [[lat, lon], [lat, lon]] segments)}"""
     center = [track["lat"].mean(), track["lon"].mean()]
-    m = folium.Map(location=center, zoom_start=14, tiles="cartodbpositron", control_scale=True)
+    m = folium.Map(location=center, zoom_start=14, tiles="OpenStreetMap", control_scale=True)
     gps = folium.FeatureGroup("Raw GPS trace")
     folium.PolyLine(track[["lat", "lon"]].values.tolist(), color="#2a78d6", weight=2,
                     opacity=0.6, dash_array="4 4").add_to(gps)
@@ -145,9 +145,22 @@ with tab_match:
         options = []
         if trips.get("evaluator_test_trips"):
             options.append("evaluator_test")
-        options.extend(["student_test", "train"])
+        test_set = trips.get("test_set", "student_test")
+        if test_set not in options:
+            options.append(test_set)
+        if "student_test" not in options:
+            options.append("student_test")
+        options.append("train")
+        options = list(dict.fromkeys(options))
         group = c1.radio("Trip set", options, horizontal=True)
-        ids = trips.get(f"{group}_trips", [])
+        if group == "evaluator_test":
+            ids = trips.get("evaluator_test_trips", [])
+        elif group == "train":
+            ids = trips.get("train_trips", [])
+        elif group == test_set:
+            ids = trips.get("test_trips", trips.get("student_test_trips", []))
+        else:
+            ids = trips.get("student_test_trips", [])
         trip_id = c2.selectbox("Trip ID", ids) if ids else None
         top_k = c3.slider("Candidates per point (K)", 5, 30, 15)
         o1, o2 = st.columns(2)
