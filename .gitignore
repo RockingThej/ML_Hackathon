@@ -21,3 +21,8 @@ Thumbs.db
 
 # ── Archives ─────────────────────────────────────────────────────────
 *.zip
+
+# -- Data (never commit) --
+data/raw/
+data/processed/*.parquet
+__pycache__/
