@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data directories (never commit raw data)
+data/raw/
+*.zip
+
+# Virtual environments
+venv/
+.env/
+env/
+
+# Jupyter checkpoint files
+.ipynb_checkpoints
+
+# OS generated files
+.DS_Store
+Thumbs.db
+data/raw/
+data/processed/*.parquet
+*.zip
+__pycache__/
+.ipynb_checkpoints/
