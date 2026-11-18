@@ -185,7 +185,7 @@ def main():
     trip = load_trip("data/raw/train", trip_id)
 
     predictions = pd.read_csv(
-        "hmm_trip_1_predictions.csv"
+        "results/hmm_trip_1_predictions.csv"
     )
 
     predicted_route = (

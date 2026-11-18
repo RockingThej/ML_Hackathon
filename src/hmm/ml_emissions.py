@@ -39,3 +39,16 @@ def build_emission_log_probs_ml(features, scores, trip_id,
     if n_fallback:
         print(f"  trip {trip_id}: {n_fallback} point(s) without ML scores -> Gaussian fallback")
     return emissions
+
+def scores_from_candidate_probs(features, probs, trip_id):
+    """Turn per-candidate probabilities (same row order as `features`) into a
+    scores table like D's scores_<model>_test.parquet: one row per candidate,
+    with point_prob normalised to sum to 1 within each GPS point."""
+    p = np.asarray(probs, dtype=float)
+    if len(p) != len(features):
+        raise ValueError(f"{len(p)} probabilities for {len(features)} candidate rows")
+    out = features[["point_idx", "candidate_arc_id"]].reset_index(drop=True).copy()
+    out.insert(0, "trip_id", int(trip_id))
+    out["point_prob"] = np.clip(p, 1e-12, None)
+    out["point_prob"] = out["point_prob"] / out.groupby("point_idx")["point_prob"].transform("sum")
+    return out

@@ -118,14 +118,14 @@ def evaluate_trip(root, trip_id, prediction_file):
         "baseline_correct": baseline_correct
     })
 
-    report.to_csv("hmm_trip_1_evaluation.csv", index=False)
+    report.to_csv("results/hmm_trip_1_evaluation.csv", index=False)
 
-    print("\nSaved: hmm_trip_1_evaluation.csv")
+    print("\nSaved: results/hmm_trip_1_evaluation.csv")
 
 
 if __name__ == "__main__":
     evaluate_trip(
         root="data/raw/train",
         trip_id=1,
-        prediction_file="hmm_trip_1_predictions.csv"
+        prediction_file="results/hmm_trip_1_predictions.csv"
     )

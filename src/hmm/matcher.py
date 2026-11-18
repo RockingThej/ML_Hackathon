@@ -145,6 +145,6 @@ if __name__ == "__main__":
     print("\nFirst 10 predictions:")
     print(result.head(10).to_string(index=False))
 
-    result.to_csv("hmm_trip_1_predictions.csv", index=False)
+    result.to_csv("results/hmm_trip_1_predictions.csv", index=False)
 
-    print("\nSaved: hmm_trip_1_predictions.csv")
+    print("\nSaved: results/hmm_trip_1_predictions.csv")
