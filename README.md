@@ -8,6 +8,15 @@ Pipeline:
 3. **HMM + Viterbi**: picks the most likely *connected* sequence of arcs across the whole trip.
 4. **API** and **UI**: serve and visualise the result.
 
+## Team Details
+
+| Name | GitHub | Role & Responsibilities |
+|---|---|---|
+| **Thejaswi S** | [@RockingThej](https://github.com/RockingThej) | API, System Integration & Server-side Evaluation |
+| **Thejus Reddy** | [@Thejus-07](https://github.com/Thejus-07) | PyTorch MLP, XGBoost (GPU), Optuna Bayesian Tuning & UI |
+| **Thejaswini S** | [@thejaswini-s5702](https://github.com/thejaswini-s5702) | HMM, Viterbi Decoding & Route Reconstruction |
+| **Tharunyah Sudhakar** | [@clutchmodev2](https://github.com/clutchmodev2) | Dataset Preprocessing, Feature Engineering & Candidate Generation |
+
 ## Results (10 held-out test trips, 19,133 labelled GPS points)
 
 **Classifiers**, from `results/model_comparison.csv`. Miss-rate is the share of points whose top candidate isn't the true arc; lower is better.
