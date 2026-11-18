@@ -25,4 +25,5 @@ Thumbs.db
 # -- Data (never commit) --
 data/raw/
 data/processed/*.parquet
+artifacts/*.joblib
 __pycache__/
