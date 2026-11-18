@@ -19,6 +19,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -87,7 +88,10 @@ async def log_requests(request: Request, call_next):
 # ---------------------------------------------------------------------------
 DATA_DIR = PROJECT_ROOT / "data" / "raw"
 DATA_TRAIN = DATA_DIR / "train"
-DATA_TEST = DATA_DIR / "student_test"
+# Which test folder to serve. Default student_test; for the evaluators run with
+#   PowerShell:  $env:PATHSNAP_TEST_SET = "evaluator_test"
+TEST_SET = os.environ.get("PATHSNAP_TEST_SET", "student_test")
+DATA_TEST = DATA_DIR / TEST_SET
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 
 _loaded_model: Any = None
@@ -161,8 +165,10 @@ class PredictResponse(BaseModel):
 
 
 class TripListResponse(BaseModel):
-    student_test_trips: List[int]
+    test_set: str = Field(..., description="Name of the test folder being served")
+    test_trips: List[int]
     train_trips: List[int]
+    student_test_trips: List[int] = Field(default_factory=list, description="Same as test_trips (kept for older UIs)")
 
 
 # ---------------------------------------------------------------------------
@@ -175,16 +181,18 @@ def health():
         "status": "healthy",
         "model_loaded": model_name,
         "train_trips_available": len(list_trips(DATA_TRAIN)) if DATA_TRAIN.exists() else 0,
+        "test_set": TEST_SET,
         "test_trips_available": len(list_trips(DATA_TEST)) if DATA_TEST.exists() else 0,
     }
 
 
 @app.get("/trips", response_model=TripListResponse)
 def get_trips():
-    """List available evaluation (student_test) and training trips."""
+    """List available test-set trips (folder from PATHSNAP_TEST_SET) and training trips."""
     train = list_trips(DATA_TRAIN) if DATA_TRAIN.exists() else []
     test = list_trips(DATA_TEST) if DATA_TEST.exists() else []
-    return TripListResponse(student_test_trips=test, train_trips=train)
+    return TripListResponse(test_set=TEST_SET, test_trips=test, train_trips=train,
+                             student_test_trips=test)
 
 
 @app.post("/predict", response_model=PredictResponse)
@@ -203,7 +211,7 @@ def predict(req: PredictRequest):
     elif DATA_TRAIN.exists() and (DATA_TRAIN / f"{trip_id:08d}").exists():
         trip_root = DATA_TRAIN
     else:
-        raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found in train or student_test datasets.")
+        raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found in train or {TEST_SET} datasets.")
 
     try:
         trip = load_trip(trip_root, trip_id)
