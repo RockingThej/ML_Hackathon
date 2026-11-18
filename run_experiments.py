@@ -1,22 +1,21 @@
 """
 run_experiments.py  –  train and evaluate all PathSnap models
 ==============================================================
-Trains Logistic Regression, KNN, Random Forest, and LightGBM on
-features_train.parquet and evaluates on features_test.parquet.
-Results are logged to results/model_comparison.csv.
+Data schema (from A's feature pipeline):
+  features_train/test.parquet columns:
+    trip_id, point_idx, candidate_arc_id, dist_to_arc, dist_rank,
+    bearing_diff, heading_valid, speed, arc_length, proj_pos, dt_prev, label
 
-Usage
------
-    # Smoke-test on dummy data (auto-generates if parquets are missing)
-    python run_experiments.py --smoke
+  label = 1 if this candidate is the true arc, 0 otherwise
+  → Binary classification: score each candidate, pick highest per point.
 
-    # Full run on real parquets from A
-    python run_experiments.py
+Primary metric: candidate miss-rate (fraction of GPS points where true arc
+                is not the top-scored candidate).
 
-    # Run specific models only
-    python run_experiments.py --models logreg rf
-
-    # Save trained models to artifacts/
+Usage:
+    python run_experiments.py                  # full run, all models
+    python run_experiments.py --models logreg rf lgbm
+    python run_experiments.py --smoke          # 20k rows, tiny models
     python run_experiments.py --save_models
 """
 
@@ -34,23 +33,56 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.metrics import f1_score, log_loss, accuracy_score
 import lightgbm as lgb
 
-# Project root is the directory containing this file
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from metrics import evaluate, append_to_comparison_csv
-from make_dummy_features import FEATURE_COLS, LABEL_COL
-
-warnings.filterwarnings("ignore", category=UserWarning)
 
 TRAIN_PATH = PROJECT_ROOT / "data" / "processed" / "features_train.parquet"
-TEST_PATH = PROJECT_ROOT / "data" / "processed" / "features_test.parquet"
-ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
-RESULTS_DIR = PROJECT_ROOT / "results"
+TEST_PATH  = PROJECT_ROOT / "data" / "processed" / "features_test.parquet"
+ARTIFACTS  = PROJECT_ROOT / "artifacts"
+RESULTS    = PROJECT_ROOT / "results"
+CV_PATH    = PROJECT_ROOT / "data" / "processed" / "cv_folds.parquet"
+
+FEATURE_COLS = [
+    "dist_to_arc", "dist_rank", "bearing_diff",
+    "heading_valid", "speed", "arc_length", "proj_pos", "dt_prev",
+]
+
+# ---------------------------------------------------------------------------
+# Miss-rate computation (candidate-level → point-level)
+# ---------------------------------------------------------------------------
+
+def candidate_miss_rate(df: pd.DataFrame, score_col: str = "score") -> float:
+    """
+    Given a DataFrame with one row per (point, candidate), scored by score_col,
+    pick the top-scored candidate per point and compute fraction where label=0.
+    """
+    best = (
+        df.sort_values(score_col, ascending=False)
+          .groupby(["trip_id", "point_idx"], sort=False)
+          .first()
+          .reset_index()
+    )
+    return float(1.0 - best["label"].mean())
+
+
+def top1_accuracy(df: pd.DataFrame, score_col: str = "score") -> float:
+    best = (
+        df.sort_values(score_col, ascending=False)
+          .groupby(["trip_id", "point_idx"], sort=False)
+          .first()
+          .reset_index()
+    )
+    return float(best["label"].mean())
 
 
 # ---------------------------------------------------------------------------
@@ -58,75 +90,56 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 # ---------------------------------------------------------------------------
 
 def load_data(smoke: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load train/test parquets. If missing and smoke=True, generate dummies."""
-    if not TRAIN_PATH.exists() or not TEST_PATH.exists():
-        if smoke:
-            print("Parquets not found — generating dummy features for smoke test …")
-            os.system(f'python "{PROJECT_ROOT / "make_dummy_features.py"}"')
-        else:
-            raise FileNotFoundError(
-                f"Missing parquets.\n  train: {TRAIN_PATH}\n  test : {TEST_PATH}\n"
-                "Run with --smoke to auto-generate dummies, or wait for A's files."
-            )
+    if not TRAIN_PATH.exists():
+        raise FileNotFoundError(f"Train parquet not found: {TRAIN_PATH}")
+    if not TEST_PATH.exists():
+        raise FileNotFoundError(f"Test parquet not found: {TEST_PATH}")
 
+    print("Loading parquets …")
     train = pd.read_parquet(TRAIN_PATH)
-    test = pd.read_parquet(TEST_PATH)
+    test  = pd.read_parquet(TEST_PATH)
+
+    if smoke:
+        # Sample 20k rows (keeping candidate groups intact)
+        trips = train["trip_id"].unique()[:5]
+        train = train[train["trip_id"].isin(trips)].copy()
+        trips_t = test["trip_id"].unique()[:3]
+        test = test[test["trip_id"].isin(trips_t)].copy()
+        print(f"  [smoke] using {len(train):,} train / {len(test):,} test rows")
+    else:
+        print(f"  Train: {len(train):,} rows | Test: {len(test):,} rows")
+
     return train, test
 
 
-def prepare_xy(
-    train: pd.DataFrame,
-    test: pd.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, LabelEncoder]:
-    """Extract feature matrix and encoded labels."""
-    # Only keep feature columns that are present in this dataset
-    available = [c for c in FEATURE_COLS if c in train.columns]
-    missing = [c for c in FEATURE_COLS if c not in train.columns]
-    if missing:
-        print(f"  [warn] Missing feature columns (will skip): {missing}")
-
-    X_train = train[available].to_numpy(dtype=np.float32)
-    X_test = test[available].to_numpy(dtype=np.float32)
-
-    le = LabelEncoder()
-    y_train = le.fit_transform(train[LABEL_COL])
-    y_test = le.transform(test[LABEL_COL])
-
-    return X_train, y_train, X_test, y_test, le
-
-
 # ---------------------------------------------------------------------------
-# Model definitions
+# Model zoo
 # ---------------------------------------------------------------------------
 
 def build_models(smoke: bool) -> dict:
-    """Return a dict of {name: sklearn-compatible model}."""
     if smoke:
-        # Tiny models for the smoke test
         return {
-            "logreg": LogisticRegression(max_iter=100, C=1.0, solver="saga",
-                                          multi_class="auto", n_jobs=-1),
-            "knn":    KNeighborsClassifier(n_neighbors=3, n_jobs=-1),
-            "rf":     RandomForestClassifier(n_estimators=20, max_depth=4,
-                                              n_jobs=-1, random_state=42),
-            "lgbm":   lgb.LGBMClassifier(n_estimators=50, num_leaves=15,
-                                          n_jobs=-1, random_state=42, verbose=-1),
-        }
-    else:
-        return {
-            "logreg": LogisticRegression(max_iter=1000, C=1.0, solver="saga",
-                                          multi_class="auto", n_jobs=-1),
+            "logreg": LogisticRegression(max_iter=200, C=1.0, solver="saga", n_jobs=-1),
+            "gnb":    GaussianNB(),
             "knn":    KNeighborsClassifier(n_neighbors=5, n_jobs=-1),
-            "rf":     RandomForestClassifier(n_estimators=200, max_depth=None,
-                                              n_jobs=-1, random_state=42),
-            "lgbm":   lgb.LGBMClassifier(n_estimators=500, num_leaves=63,
-                                          learning_rate=0.05, n_jobs=-1,
+            "rf":     RandomForestClassifier(n_estimators=30, max_depth=6, n_jobs=-1, random_state=42),
+            "lgbm":   lgb.LGBMClassifier(n_estimators=100, num_leaves=31, n_jobs=-1,
                                           random_state=42, verbose=-1),
         }
+    return {
+        "logreg": LogisticRegression(max_iter=1000, C=1.0, solver="saga", n_jobs=-1),
+        "gnb":    GaussianNB(),
+        "knn":    KNeighborsClassifier(n_neighbors=5, metric="euclidean", n_jobs=-1),
+        "rf":     RandomForestClassifier(n_estimators=300, max_depth=None,
+                                          n_jobs=-1, random_state=42),
+        "lgbm":   lgb.LGBMClassifier(n_estimators=500, num_leaves=63, learning_rate=0.05,
+                                      n_jobs=-1, random_state=42, verbose=-1,
+                                      colsample_bytree=0.8, subsample=0.8),
+    }
 
 
 # ---------------------------------------------------------------------------
-# Training & evaluation loop
+# Main loop
 # ---------------------------------------------------------------------------
 
 def run(
@@ -140,69 +153,93 @@ def run(
     print("=" * 60)
 
     train, test = load_data(smoke=smoke)
-    print(f"\nTrain : {train.shape[0]} rows  |  Test : {test.shape[0]} rows")
 
-    X_train, y_train, X_test, y_test, le = prepare_xy(train, test)
-    n_classes = len(le.classes_)
-    print(f"Features : {X_train.shape[1]}  |  Arc classes : {n_classes}")
+    X_train = train[FEATURE_COLS].to_numpy(dtype=np.float32)
+    y_train = train["label"].to_numpy()
+
+    X_test  = test[FEATURE_COLS].to_numpy(dtype=np.float32)
+    y_test  = test["label"].to_numpy()
+
+    print(f"Features : {X_train.shape[1]}  |  Positive rate train: {y_train.mean():.4f}")
+
+    ARTIFACTS.mkdir(exist_ok=True)
+    RESULTS.mkdir(exist_ok=True)
 
     models = build_models(smoke=smoke)
     if model_names:
         models = {k: v for k, v in models.items() if k in model_names}
-        if not models:
-            raise ValueError(f"No matching models. Choose from: {list(build_models(False).keys())}")
 
     all_results = []
-    ARTIFACTS_DIR.mkdir(exist_ok=True)
-    RESULTS_DIR.mkdir(exist_ok=True)
 
     for name, model in models.items():
-        print(f"\n{'─' * 40}")
+        print(f"\n{'─' * 50}")
         print(f"  Training : {name}")
+
         t0 = time.perf_counter()
         model.fit(X_train, y_train)
         train_secs = time.perf_counter() - t0
         print(f"  Fit time : {train_secs:.1f}s")
 
-        # Predictions
-        y_pred = model.predict(X_test)
-
-        # Top-k predictions (top 5 if model supports predict_proba)
-        y_pred_topk = None
-        y_proba = None
+        # Score test candidates
+        t1 = time.perf_counter()
         if hasattr(model, "predict_proba"):
-            y_proba = model.predict_proba(X_test)
-            top_k = min(5, n_classes)
-            topk_indices = np.argsort(y_proba, axis=1)[:, -top_k:][:, ::-1]
-            y_pred_topk = le.classes_[topk_indices]
+            scores = model.predict_proba(X_test)[:, 1]   # P(label=1)
+        else:
+            scores = model.decision_function(X_test) if hasattr(model, "decision_function") \
+                     else model.predict(X_test).astype(float)
+        infer_secs = time.perf_counter() - t1
 
-        # Evaluate
-        results = evaluate(
-            y_true=le.classes_[y_test],
-            y_pred=le.classes_[y_pred],
-            y_pred_topk=y_pred_topk,
-            y_proba=y_proba,
-            model_name=name,
-        )
-        results["train_seconds"] = round(train_secs, 2)
+        test_scored = test[["trip_id", "point_idx", "label"]].copy()
+        test_scored["score"] = scores
+
+        mr   = candidate_miss_rate(test_scored)
+        acc1 = top1_accuracy(test_scored)
+
+        # Standard binary metrics
+        y_pred = (scores >= 0.5).astype(int)
+        f1_mac = f1_score(y_test, y_pred, average="macro", zero_division=0)
+        try:
+            ll = log_loss(y_test, scores)
+        except Exception:
+            ll = float("nan")
+
+        results = {
+            "model": name,
+            "n_samples": len(y_test),
+            "miss_rate": mr,
+            "accuracy_at_1": acc1,
+            "accuracy_at_k": acc1,   # k=1 here (top candidate)
+            "f1_macro": f1_mac,
+            "log_loss": ll,
+            "train_seconds": round(train_secs, 2),
+            "infer_seconds": round(infer_secs, 4),
+        }
+
+        # Print results
+        print(f"  Miss-rate   : {mr:.4f}  ← primary metric")
+        print(f"  Accuracy @1 : {acc1:.4f}")
+        print(f"  F1 macro    : {f1_mac:.4f}")
+        print(f"  Log-loss    : {ll:.4f}")
+        print(f"  Infer time  : {infer_secs:.3f}s")
+
         all_results.append(results)
+        append_to_comparison_csv(results, csv_path=str(RESULTS / "model_comparison.csv"))
 
-        # Save to comparison CSV
-        append_to_comparison_csv(results, csv_path=str(RESULTS_DIR / "model_comparison.csv"))
-
-        # Optionally persist model
         if save_models:
-            model_path = ARTIFACTS_DIR / f"{name}.joblib"
-            joblib.dump(model, model_path)
-            print(f"  Model saved → {model_path}")
+            path = ARTIFACTS / f"{name}.joblib"
+            joblib.dump(model, path)
+            print(f"  Saved → {path}")
 
-    # Final leaderboard
+    # Leaderboard
     print("\n" + "=" * 60)
-    print("  Leaderboard (sorted by miss-rate ↑ lower is better)")
+    print("  Leaderboard  (miss-rate ↑ lower is better)")
     print("=" * 60)
-    board = pd.DataFrame(all_results)[["model", "miss_rate", "accuracy_at_1",
-                                        "accuracy_at_k", "f1_macro"]]
-    board = board.sort_values("miss_rate")
+    board = (
+        pd.DataFrame(all_results)
+        [["model", "miss_rate", "accuracy_at_1", "f1_macro", "log_loss",
+          "train_seconds", "infer_seconds"]]
+        .sort_values("miss_rate")
+    )
     print(board.to_string(index=False))
     print()
 
@@ -210,18 +247,18 @@ def run(
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run PathSnap model experiments.")
     parser.add_argument("--smoke", action="store_true",
-                        help="Smoke-test on dummy data (auto-generated if missing)")
+                        help="Quick run on first 5 trips only")
     parser.add_argument("--models", nargs="+", default=None,
-                        choices=["logreg", "knn", "rf", "lgbm"],
-                        help="Subset of models to run (default: all)")
+                        choices=["logreg", "gnb", "knn", "rf", "lgbm"],
+                        help="Subset of models to run (default: all 5)")
     parser.add_argument("--save_models", action="store_true",
-                        help="Persist trained models to artifacts/ with joblib")
+                        help="Persist trained models to artifacts/")
     args = parser.parse_args()
 
     run(model_names=args.models, smoke=args.smoke, save_models=args.save_models)

@@ -1,56 +1,66 @@
 """
-api/main.py  –  PathSnap FastAPI backend (C's deliverable)
-===========================================================
-Endpoints
----------
-  GET  /trips                   – list available trip IDs for the evaluator
-  POST /predict                 – run the full prediction pipeline for a trip
-  GET  /health                  – quick liveness check
+api/main.py  –  PathSnap FastAPI Backend (Laptop 1)
+===================================================
+Endpoints:
+  GET  /health                  – Health check & model status
+  GET  /trips                   – List evaluation trips (and training trips)
+  POST /predict                 – Run end-to-end map-matching pipeline for a trip
+  GET  /trips/{trip_id}/track   – Get raw GPS points for visualization
+  GET  /trips/{trip_id}/network – Get road network nodes and arcs for Folium map
 
-Run locally:
-    uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-
-Or from project root:
-    python -m uvicorn api.main:app --reload
+Architecture:
+  - Model & API run on Laptop 1 (evaluator UI runs on Laptop 2)
+  - Ground truth labels NEVER exposed to client; evaluation computed server-side
+  - Uses A's candidate generator (src.features.candidates.build_features)
+  - Uses trained classifier (LGBM / Random Forest) from artifacts/
+  - Structured request logging with millisecond latencies
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional
 
 import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# Ensure repo root is in Python path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data.loaders import load_trip, list_trips
+from src.features.candidates import build_features, FEATURES as FEATURE_COLS
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# Logging configuration
 # ---------------------------------------------------------------------------
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger("pathsnap.api")
+logger = logging.getLogger("pathsnap.api")
 
 # ---------------------------------------------------------------------------
-# App init
+# FastAPI app setup
 # ---------------------------------------------------------------------------
-
 app = FastAPI(
     title="PathSnap API",
-    description="Map-matching & route reconstruction API for the PathSnap hackathon.",
-    version="0.1.0",
+    description="Distributed Map-Matching & Route Reconstruction API (Laptop 1)",
+    version="1.0.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # tighten before production
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -58,291 +68,209 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Request logging middleware
 # ---------------------------------------------------------------------------
-
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    t0 = time.perf_counter()
+    start_time = time.perf_counter()
     response = await call_next(request)
-    elapsed = (time.perf_counter() - t0) * 1000
-    log.info(
-        "%s %s  status=%d  %.1f ms",
+    duration_ms = (time.perf_counter() - start_time) * 1000.0
+    logger.info(
+        "%s %s -> status=%d (%.2f ms)",
         request.method,
         request.url.path,
         response.status_code,
-        elapsed,
+        duration_ms,
     )
     return response
 
 # ---------------------------------------------------------------------------
-# Paths & constants
+# Paths and model cache
 # ---------------------------------------------------------------------------
+DATA_DIR = PROJECT_ROOT / "data" / "raw"
+DATA_TRAIN = DATA_DIR / "train"
+DATA_TEST = DATA_DIR / "student_test"
+ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 
-PROJECT_ROOT = Path(__file__).parent.parent
-DATA_TRAIN   = PROJECT_ROOT / "data" / "raw" / "train"
-DATA_TEST    = PROJECT_ROOT / "data" / "raw" / "student_test"
-ARTIFACTS    = PROJECT_ROOT / "artifacts"
-
-# ---------------------------------------------------------------------------
-# Model loading (lazy, cached at startup)
-# ---------------------------------------------------------------------------
-
-_model: Any = None
-_label_encoder: Any = None
+_loaded_model: Any = None
+_model_name: str = "none"
 
 
-def _load_model() -> tuple[Any, Any]:
-    global _model, _label_encoder
-    if _model is not None:
-        return _model, _label_encoder
+def get_model():
+    """Load and cache the best available trained model."""
+    global _loaded_model, _model_name
+    if _loaded_model is not None:
+        return _loaded_model, _model_name
 
-    model_path = ARTIFACTS / "best_model.joblib"
-    le_path    = ARTIFACTS / "label_encoder.joblib"
+    # Priority order: lgbm -> rf -> logreg
+    for candidate in ["lgbm.joblib", "rf.joblib", "logreg.joblib", "best_model.joblib"]:
+        p = ARTIFACTS_DIR / candidate
+        if p.exists():
+            try:
+                _loaded_model = joblib.load(p)
+                _model_name = candidate.replace(".joblib", "")
+                logger.info("Successfully loaded model: %s from %s", _model_name, p)
+                return _loaded_model, _model_name
+            except Exception as e:
+                logger.warning("Could not load %s: %s", p, e)
 
-    if model_path.exists() and le_path.exists():
-        log.info("Loading model from %s", model_path)
-        _model = joblib.load(model_path)
-        _label_encoder = joblib.load(le_path)
-        log.info("Model loaded: %s", type(_model).__name__)
-    else:
-        log.warning(
-            "No trained model found at %s. "
-            "/predict will return dummy output until a model is trained.",
-            model_path,
-        )
-        _model = None
-        _label_encoder = None
-
-    return _model, _label_encoder
+    logger.warning("No pre-trained model found in %s; falling back to distance heuristic.", ARTIFACTS_DIR)
+    _model_name = "distance_heuristic"
+    return None, _model_name
 
 
 @app.on_event("startup")
-def startup_event():
-    _load_model()
-    log.info("PathSnap API started ✓")
-
-
-# ---------------------------------------------------------------------------
-# Data loading helpers (raw text files)
-# ---------------------------------------------------------------------------
-
-def _find_trip_dir(trip_id: str) -> Path:
-    """Return directory containing trip files, searching train then test."""
-    for base in (DATA_TRAIN, DATA_TEST):
-        d = base / trip_id
-        if d.exists():
-            return d
-    raise FileNotFoundError(f"Trip '{trip_id}' not found in train or student_test.")
-
-
-def _load_track(trip_dir: Path, trip_id: str) -> pd.DataFrame:
-    p = trip_dir / f"{trip_id}.track"
-    df = pd.read_csv(p, sep=r"\s+", header=None, names=["lon", "lat", "timestamp"])
-    return df
-
-
-def _load_arcs(trip_dir: Path, trip_id: str) -> pd.DataFrame:
-    p = trip_dir / f"{trip_id}.arcs"
-    df = pd.read_csv(p, sep=r"\s+", header=None, names=["from_node", "to_node"])
-    df.index.name = "arc_id"
-    return df.reset_index()
-
-
-def _load_nodes(trip_dir: Path, trip_id: str) -> pd.DataFrame:
-    p = trip_dir / f"{trip_id}.nodes"
-    df = pd.read_csv(p, sep=r"\s+", header=None, names=["lon", "lat"])
-    df.index.name = "node_id"
-    return df.reset_index()
-
-
-def _load_route(trip_dir: Path, trip_id: str) -> list[int] | None:
-    """Load ground truth route (may not exist for evaluator trips)."""
-    p = trip_dir / f"{trip_id}.route"
-    if not p.exists():
-        return None
-    return pd.read_csv(p, header=None)[0].tolist()
-
-
-# ---------------------------------------------------------------------------
-# Minimal candidate generation (placeholder — will be replaced by A's work)
-# ---------------------------------------------------------------------------
-
-def _generate_candidates(
-    track: pd.DataFrame,
-    arcs: pd.DataFrame,
-    nodes: pd.DataFrame,
-    top_k: int = 5,
-) -> pd.DataFrame:
-    """
-    For each GPS point, return the nearest top_k arcs by midpoint proximity.
-    This is a simple spatial heuristic placeholder.
-    A's features pipeline will replace this with proper projected-distance candidates.
-
-    Returns DataFrame with columns: [point_idx, arc_id, dist_m, (feature cols...)]
-    """
-    from math import radians, cos, sqrt
-
-    def haversine_approx(lat1, lon1, lat2, lon2):
-        """Fast flat-earth approximation in metres."""
-        dlat = radians(lat2 - lat1) * 6_371_000
-        dlon = radians(lon2 - lon1) * 6_371_000 * cos(radians((lat1 + lat2) / 2))
-        return sqrt(dlat**2 + dlon**2)
-
-    # Compute arc midpoints
-    arc_mids = []
-    for _, arc in arcs.iterrows():
-        fn = int(arc["from_node"])
-        tn = int(arc["to_node"])
-        if fn < len(nodes) and tn < len(nodes):
-            mid_lon = (nodes.iloc[fn]["lon"] + nodes.iloc[tn]["lon"]) / 2
-            mid_lat = (nodes.iloc[fn]["lat"] + nodes.iloc[tn]["lat"]) / 2
-        else:
-            mid_lon, mid_lat = nodes.iloc[fn]["lon"], nodes.iloc[fn]["lat"]
-        arc_mids.append((arc["arc_id"], mid_lon, mid_lat))
-
-    arc_mid_arr = np.array([(a, lo, la) for a, lo, la in arc_mids])
-
-    rows = []
-    for idx, row in track.iterrows():
-        gps_lon, gps_lat = row["lon"], row["lat"]
-
-        # Euclidean approximation in degrees (fast, good enough for candidate gen)
-        dlat = (arc_mid_arr[:, 2] - gps_lat) * 111_320
-        dlon = (arc_mid_arr[:, 1] - gps_lon) * 111_320 * np.cos(np.radians(gps_lat))
-        dists = np.sqrt(dlat**2 + dlon**2)
-
-        nearest_idx = np.argsort(dists)[:top_k]
-        for rank, nidx in enumerate(nearest_idx):
-            rows.append({
-                "point_idx": idx,
-                "arc_id": int(arc_mid_arr[nidx, 0]),
-                "dist_m": float(dists[nidx]),
-                "rank": rank,
-            })
-
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------------------
-# Prediction pipeline
-# ---------------------------------------------------------------------------
-
-def _predict_route(trip_id: str) -> dict:
-    """Full prediction pipeline. Returns structured result dict."""
-    trip_dir = _find_trip_dir(trip_id)
-
-    track = _load_track(trip_dir, trip_id)
-    arcs  = _load_arcs(trip_dir, trip_id)
-    nodes = _load_nodes(trip_dir, trip_id)
-    true_route = _load_route(trip_dir, trip_id)
-
-    log.info("Trip %s: %d GPS points, %d arcs", trip_id, len(track), len(arcs))
-
-    # Candidate generation
-    candidates = _generate_candidates(track, arcs, nodes, top_k=5)
-
-    # Model scoring
-    model, le = _load_model()
-
-    if model is not None:
-        # Build a minimal feature vector per candidate (extend when A's features arrive)
-        feature_cols = ["dist_m", "rank"]
-        X = candidates[feature_cols].to_numpy(dtype=np.float32)
-
-        try:
-            # predict_proba → pick top candidate per point
-            proba = model.predict_proba(X)
-            candidates["score"] = proba.max(axis=1)
-        except Exception:
-            # Fallback: score by inverse distance
-            candidates["score"] = 1.0 / (candidates["dist_m"] + 1e-6)
-    else:
-        # No model yet — score by inverse distance (nearest arc wins)
-        candidates["score"] = 1.0 / (candidates["dist_m"] + 1e-6)
-
-    # Pick best-scoring arc per GPS point
-    best = (
-        candidates
-        .sort_values("score", ascending=False)
-        .groupby("point_idx", sort=True)
-        .first()
-        .reset_index()[["point_idx", "arc_id"]]
-    )
-
-    predicted_route = best["arc_id"].tolist()
-
-    # Accuracy vs ground truth (server-side only)
-    accuracy: float | None = None
-    if true_route is not None:
-        min_len = min(len(predicted_route), len(true_route))
-        correct = sum(p == t for p, t in zip(predicted_route[:min_len], true_route[:min_len]))
-        accuracy = correct / len(true_route)
-        log.info("Trip %s accuracy: %.4f", trip_id, accuracy)
-
-    return {
-        "trip_id": trip_id,
-        "n_gps_points": len(track),
-        "predicted_route": predicted_route,
-        "accuracy": accuracy,
-        "model_used": type(model).__name__ if model else "distance_heuristic",
-    }
+def on_startup():
+    get_model()
+    logger.info("PathSnap API initialization complete.")
 
 
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
-
 class PredictRequest(BaseModel):
-    trip_id: str
-    top_k: int = 5
+    trip_id: int = Field(..., description="Trip ID (e.g. 0, 7, 9, 40)")
+    top_k: int = Field(15, description="Number of candidates to generate per GPS point")
+
+
+class MetricSummary(BaseModel):
+    point_accuracy: float = Field(..., description="Observation-level top-1 accuracy")
+    candidate_miss_rate: float = Field(..., description="Fraction of points where true arc missed")
+    n_evaluated_points: int = Field(..., description="Number of GPS points evaluated against truth")
 
 
 class PredictResponse(BaseModel):
-    trip_id: str
-    n_gps_points: int
-    predicted_route: list[int]
-    accuracy: float | None
-    model_used: str
-    elapsed_ms: float
+    trip_id: int
+    n_points: int
+    model_name: str
+    predicted_route: List[int] = Field(..., description="Reconstructed sequence of arc_ids")
+    metrics: Optional[MetricSummary] = Field(None, description="Server-side evaluation if ground truth is present")
+    inference_time_ms: float
 
 
 class TripListResponse(BaseModel):
-    train_trips: list[str]
-    test_trips: list[str]
+    student_test_trips: List[int]
+    train_trips: List[int]
 
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": app.version}
+    _, model_name = get_model()
+    return {
+        "status": "healthy",
+        "model_loaded": model_name,
+        "train_trips_available": len(list_trips(DATA_TRAIN)) if DATA_TRAIN.exists() else 0,
+        "test_trips_available": len(list_trips(DATA_TEST)) if DATA_TEST.exists() else 0,
+    }
 
 
 @app.get("/trips", response_model=TripListResponse)
-def list_trips():
-    """Return all available trip IDs."""
-    train = sorted(p.name for p in DATA_TRAIN.iterdir() if p.is_dir()) if DATA_TRAIN.exists() else []
-    test  = sorted(p.name for p in DATA_TEST.iterdir()  if p.is_dir()) if DATA_TEST.exists()  else []
-    return TripListResponse(train_trips=train, test_trips=test)
+def get_trips():
+    """List available evaluation (student_test) and training trips."""
+    train = list_trips(DATA_TRAIN) if DATA_TRAIN.exists() else []
+    test = list_trips(DATA_TEST) if DATA_TEST.exists() else []
+    return TripListResponse(student_test_trips=test, train_trips=train)
 
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
     """
-    Run the full PathSnap pipeline for a trip and return predicted route + accuracy.
-    Ground-truth labels stay server-side; accuracy is computed internally.
+    Predict road segments (arc_ids) for each GPS observation in a trip.
+    Ground truth is kept strictly on the server and used only to report evaluation metrics.
     """
-    log.info("POST /predict  trip_id=%s", req.trip_id)
+    trip_id = req.trip_id
     t0 = time.perf_counter()
 
-    try:
-        result = _predict_route(req.trip_id)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        log.exception("Prediction failed for trip %s", req.trip_id)
-        raise HTTPException(status_code=500, detail=f"Prediction error: {e}")
+    # Determine data directory
+    trip_root = None
+    if DATA_TEST.exists() and (DATA_TEST / f"{trip_id:08d}").exists():
+        trip_root = DATA_TEST
+    elif DATA_TRAIN.exists() and (DATA_TRAIN / f"{trip_id:08d}").exists():
+        trip_root = DATA_TRAIN
+    else:
+        raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found in train or student_test datasets.")
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    return PredictResponse(**result, elapsed_ms=round(elapsed_ms, 1))
+    try:
+        trip = load_trip(trip_root, trip_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load trip files: {e}")
+
+    # Generate candidate features using A's candidate generator
+    try:
+        # Generate with labels if route is available for server-side evaluation
+        has_route = trip.get("route") is not None
+        df_feats = build_features(trip, K=req.top_k, with_labels=has_route)
+    except Exception as e:
+        logger.exception("Feature generation failed for trip %d", trip_id)
+        raise HTTPException(status_code=500, detail=f"Feature extraction failed: {e}")
+
+    model, model_name = get_model()
+
+    # Score candidates
+    if model is not None and hasattr(model, "predict_proba"):
+        X = df_feats[FEATURE_COLS].to_numpy(dtype=np.float32)
+        # Probability of being the true arc (class 1)
+        scores = model.predict_proba(X)[:, 1]
+    elif model is not None and hasattr(model, "decision_function"):
+        X = df_feats[FEATURE_COLS].to_numpy(dtype=np.float32)
+        scores = model.decision_function(X)
+    else:
+        # Heuristic fallback: lower distance to arc gets higher score
+        scores = -df_feats["dist_to_arc"].to_numpy()
+
+    df_feats["score"] = scores
+
+    # Select top candidate per point
+    best_candidates = (
+        df_feats.sort_values("score", ascending=False)
+        .groupby("point_idx", sort=True)
+        .first()
+        .reset_index()
+    )
+
+    predicted_route = best_candidates["candidate_arc_id"].tolist()
+    n_points = len(trip["track"])
+
+    # Compute server-side evaluation if ground truth exists
+    metric_summary = None
+    if has_route and "label" in df_feats.columns:
+        # Only evaluate on points with usable ground truth
+        evaluated = best_candidates[best_candidates.get("has_truth", 1) == 1]
+        if len(evaluated) > 0:
+            acc = float(evaluated["label"].mean())
+            miss = 1.0 - acc
+            metric_summary = MetricSummary(
+                point_accuracy=round(acc, 4),
+                candidate_miss_rate=round(miss, 4),
+                n_evaluated_points=len(evaluated),
+            )
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    return PredictResponse(
+        trip_id=trip_id,
+        n_points=n_points,
+        model_name=model_name,
+        predicted_route=predicted_route,
+        metrics=metric_summary,
+        inference_time_ms=round(elapsed_ms, 2),
+    )
+
+
+@app.get("/trips/{trip_id}/track")
+def get_track(trip_id: int):
+    """Return raw GPS trajectory points for the map view."""
+    root = DATA_TEST if (DATA_TEST / f"{trip_id:08d}").exists() else DATA_TRAIN
+    if not (root / f"{trip_id:08d}").exists():
+        raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found")
+
+    trip = load_trip(root, trip_id)
+    track = trip["track"]  # lon, lat, timestamp
+    return {
+        "trip_id": trip_id,
+        "points": [
+            {"lon": float(pt[0]), "lat": float(pt[1]), "timestamp": float(pt[2])}
+            for pt in track
+        ],
+    }
