@@ -16,3 +16,6 @@ seaborn
 torch
 joblib
 requests
+streamlit
+streamlit-folium
+pytest
