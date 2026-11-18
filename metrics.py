@@ -226,10 +226,10 @@ def append_to_comparison_csv(
     csv_path: str = "results/model_comparison.csv",
 ) -> None:
     """
-    Append a results dict as one row to the shared comparison CSV.
-    Creates the file with a header if it doesn't exist.
+    Append or update a results dict in the shared comparison CSV.
+    Deduplicates by model name, keeping the latest run.
     """
-    import os, csv
+    import os
     from datetime import datetime
 
     results = dict(results)
@@ -241,16 +241,20 @@ def append_to_comparison_csv(
         "f1_macro", "log_loss",
     ]
 
-    file_exists = os.path.isfile(csv_path)
     os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else ".", exist_ok=True)
 
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(results)
+    if os.path.isfile(csv_path):
+        df = pd.read_csv(csv_path)
+        # Filter out existing row for this model
+        df = df[df["model"] != results["model"]].copy()
+        new_row = pd.DataFrame([{k: results.get(k, None) for k in fieldnames}])
+        df = pd.concat([df, new_row], ignore_index=True)
+    else:
+        df = pd.DataFrame([{k: results.get(k, None) for k in fieldnames}])
 
-    print(f"Results appended to {csv_path}")
+    df.sort_values("miss_rate", inplace=True)
+    df.to_csv(csv_path, index=False)
+    print(f"Results recorded in {csv_path} (deduplicated by model)")
 
 
 # ---------------------------------------------------------------------------
