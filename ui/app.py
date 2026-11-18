@@ -89,7 +89,7 @@ def get_arc_geometry(base, trip_id, arc_ids: tuple):
 def build_map(track: pd.DataFrame, routes: dict, show_points: bool):
     """routes: {layer name: (colour, [[lat, lon], [lat, lon]] segments)}"""
     center = [track["lat"].mean(), track["lon"].mean()]
-    m = folium.Map(location=center, zoom_start=14, tiles="cartodbpositron", control_scale=True)
+    m = folium.Map(location=center, zoom_start=14, tiles="OpenStreetMap", control_scale=True)
     gps = folium.FeatureGroup("Raw GPS trace")
     folium.PolyLine(track[["lat", "lon"]].values.tolist(), color="#2a78d6", weight=2,
                     opacity=0.6, dash_array="4 4").add_to(gps)
