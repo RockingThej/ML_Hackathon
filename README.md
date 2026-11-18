@@ -3,10 +3,10 @@
 PathSnap takes a vehicle's noisy GPS trace and works out which road arcs it actually drove on.
 
 Pipeline:
-1. **Candidate generation** (A): the 15 nearest road arcs for every GPS point.
-2. **Classifier** (C, D): scores each candidate as P(true arc).
-3. **HMM + Viterbi** (B): picks the most likely *connected* sequence of arcs across the whole trip.
-4. **API** (C) and **UI** (D): serve and visualise the result.
+1. **Candidate generation**: the 15 nearest road arcs for every GPS point.
+2. **Classifier**: scores each candidate as P(true arc).
+3. **HMM + Viterbi**: picks the most likely *connected* sequence of arcs across the whole trip.
+4. **API** and **UI**: serve and visualise the result.
 
 ## Results (10 held-out test trips, 19,133 labelled GPS points)
 
@@ -39,7 +39,8 @@ Python 3.10+.
 ```bash
 pip install -r requirements.txt
 ```
-For GPU training (Part D), install PyTorch with CUDA first. See `D_README.md`.
+
+For GPU training, install PyTorch with CUDA (e.g. `pip install torch --index-url https://download.pytorch.org/whl/cu126`).
 
 ## Data setup
 
@@ -52,7 +53,22 @@ Build the feature tables, labels and trip-level CV folds:
 ```bash
 python scripts/build_dataset.py
 ```
-This writes `data/processed/features_train.parquet`, `features_test.parquet`, `cv_folds.parquet`, `point_truth.parquet` and `candidate_miss_rate.csv`. The feature rationale is in `docs/FEATURES_WHY.md`.
+This writes `data/processed/features_train.parquet`, `features_test.parquet`, `cv_folds.parquet`, `point_truth.parquet` and `candidate_miss_rate.csv`.
+
+### Feature Rationale
+
+| Feature | Description |
+|---|---|
+| `dist_to_arc` | Strongest cue: true road is usually nearest; metres in per-trip UTM |
+| `dist_rank` | Relative nearness, comparable across dense/sparse networks |
+| `bearing_diff` | Travel heading vs arc direction (0-180 deg); separates parallel and opposite-direction roads. 90 when heading unknown |
+| `heading_valid` | Flag: 0 when the vehicle moved <1 m so heading is unreliable |
+| `speed` | Low speed = noisy GPS / stop, bearing less trustworthy |
+| `arc_length` | Short arcs at junctions behave differently from long ones |
+| `proj_pos` | Where along the arc the point projects (0-1): continuity and junction cues |
+| `dt_prev` | Time gap since previous point (not always 1 s), larger gap = more uncertainty |
+
+Labels are assigned via monotone DP matching of points to `.route` arcs (min total distance). Points with best route arc >50 m away have no truth and are excluded.
 
 ## Training
 
@@ -104,19 +120,18 @@ Both laptops must be on the same network, and the firewall on Laptop 1 must allo
 ## Repository layout
 
 ```
-api/                FastAPI backend (C)
-src/data/           loaders, projection to metric CRS (A)
-src/features/       candidate generation, features, labels (A)
-src/cv/             trip-grouped CV splits (A)
-src/models/         MLP + shared helpers (D)
-src/hmm/            emissions, transitions, Viterbi, matcher (B)
-src/route_reconstruction/  road graph (B)
-src/viz/            Folium maps (B)
-src/evaluation/     HMM evaluation (B)
-ui/                 Streamlit UI (D)
-scripts/            dataset build, EDA
-notebooks/          EDA notebooks (A, B)
-results/            leaderboard, HMM comparison, plots
-docs/               feature rationale, team hand-off notes
+api/                       FastAPI backend
+src/data/                  loaders, projection to metric CRS
+src/features/              candidate generation, features, labels
+src/cv/                    trip-grouped CV splits
+src/models/                MLP + shared helpers
+src/hmm/                   emissions, transitions, Viterbi, matcher
+src/route_reconstruction/  road graph
+src/viz/                   Folium maps
+src/evaluation/            HMM evaluation
+ui/                        Streamlit UI
+scripts/                   dataset build, EDA
+notebooks/                 EDA notebook
+results/                   leaderboard, HMM comparison, plots
+maps/                      generated HTML maps
 ```
-Per-person details: `PERSON_B_README.md`, `D_README.md`.

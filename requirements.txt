@@ -19,3 +19,5 @@ requests
 streamlit
 streamlit-folium
 pytest
+nbformat
+jupyter
