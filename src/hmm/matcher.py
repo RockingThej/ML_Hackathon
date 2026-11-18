@@ -1,4 +1,3 @@
-
 """HMM map matching for PathSnap."""
 
 import numpy as np
@@ -9,6 +8,7 @@ from src.features.candidates import build_features, prepare
 from src.route_reconstruction.road_graph import RoadGraph
 from src.hmm.viterbi import viterbi_decode_variable
 from src.hmm.transitions import build_transition_log_probs
+from src.hmm.ml_emissions import load_scores, build_emission_log_probs_ml
 
 
 def build_emission_log_probs(features, sigma=20.0, heading_sigma=45.0):
@@ -53,8 +53,17 @@ def build_emission_log_probs_from_model(features, model, K=15):
 
 
 def match_trip(root, trip_id, K=15, sigma=20.0,
-               heading_sigma=45.0, beta=50.0, model=None):
-    """Perform HMM map matching for one trip."""
+               heading_sigma=45.0, beta=50.0, model=None,
+               scores=None, emission_weight=1.0):
+    """Perform HMM map matching for one trip.
+
+    Emission source, in priority order:
+      1. scores : DataFrame from D's scores_<model>_test.parquet
+         (see src.hmm.ml_emissions.load_scores) -> log(point_prob)
+      2. model  : a loaded model with predict_proba, scored live
+      3. otherwise the hand-built Gaussian distance/bearing emissions.
+    emission_weight scales the `scores` log-emissions.
+    """
 
     trip = load_trip(root, trip_id)
 
@@ -67,7 +76,15 @@ def match_trip(root, trip_id, K=15, sigma=20.0,
     graph = RoadGraph(trip)
 
     print("Calculating emission probabilities...")
-    if model is not None and hasattr(model, "predict_proba"):
+    if scores is not None:
+        gaussian = build_emission_log_probs(
+            features, sigma=sigma, heading_sigma=heading_sigma
+        )
+        emissions = build_emission_log_probs_ml(
+            features, scores, trip_id, weight=emission_weight,
+            fallback=gaussian
+        )
+    elif model is not None and hasattr(model, "predict_proba"):
         emissions = build_emission_log_probs_from_model(features, model, K=K)
     else:
         emissions = build_emission_log_probs(
