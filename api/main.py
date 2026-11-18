@@ -100,8 +100,15 @@ def get_model():
     if _loaded_model is not None:
         return _loaded_model, _model_name
 
-    # Priority order: lgbm -> rf -> logreg
-    for candidate in ["lgbm.joblib", "rf.joblib", "logreg.joblib", "best_model.joblib"]:
+    # Priority order: best_model (tuned) -> xgb -> mlp -> lgbm -> rf -> logreg
+    for candidate in [
+        "best_model.joblib",
+        "xgb.joblib",
+        "mlp_listwise.joblib",
+        "lgbm.joblib",
+        "rf.joblib",
+        "logreg.joblib",
+    ]:
         p = ARTIFACTS_DIR / candidate
         if p.exists():
             try:
@@ -126,9 +133,14 @@ def on_startup():
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+class ArcRequest(BaseModel):
+    arc_ids: List[int]
+
+
 class PredictRequest(BaseModel):
     trip_id: int = Field(..., description="Trip ID (e.g. 0, 7, 9, 40)")
     top_k: int = Field(15, description="Number of candidates to generate per GPS point")
+    use_hmm: bool = Field(False, description="Whether to also run HMM Viterbi decoding")
 
 
 class MetricSummary(BaseModel):
@@ -142,7 +154,9 @@ class PredictResponse(BaseModel):
     n_points: int
     model_name: str
     predicted_route: List[int] = Field(..., description="Reconstructed sequence of arc_ids")
+    hmm_route: Optional[List[int]] = Field(None, description="HMM Viterbi decoded sequence of arc_ids")
     metrics: Optional[MetricSummary] = Field(None, description="Server-side evaluation if ground truth is present")
+    hmm_metrics: Optional[MetricSummary] = Field(None, description="HMM server-side evaluation if ground truth is present")
     inference_time_ms: float
 
 
@@ -246,6 +260,28 @@ def predict(req: PredictRequest):
                 n_evaluated_points=len(evaluated),
             )
 
+    # HMM route decoding if requested
+    hmm_route = None
+    hmm_metric_summary = None
+    if req.use_hmm:
+        try:
+            from src.hmm.matcher import match_trip
+            result_df, _, _ = match_trip(str(trip_root), trip_id, K=req.top_k)
+            hmm_route = result_df["predicted_arc_id"].tolist()
+            if has_route and trip.get("route") is not None:
+                true_route = trip["route"]
+                min_len = min(len(hmm_route), len(true_route))
+                if min_len > 0:
+                    matches = sum(p == t for p, t in zip(hmm_route[:min_len], true_route[:min_len]))
+                    h_acc = matches / min_len
+                    hmm_metric_summary = MetricSummary(
+                        point_accuracy=round(h_acc, 4),
+                        candidate_miss_rate=round(1.0 - h_acc, 4),
+                        n_evaluated_points=min_len,
+                    )
+        except Exception as e:
+            logger.warning("HMM decoding failed for trip %d: %s", trip_id, e)
+
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     return PredictResponse(
@@ -253,9 +289,33 @@ def predict(req: PredictRequest):
         n_points=n_points,
         model_name=model_name,
         predicted_route=predicted_route,
+        hmm_route=hmm_route,
         metrics=metric_summary,
+        hmm_metrics=hmm_metric_summary,
         inference_time_ms=round(elapsed_ms, 2),
     )
+
+
+@app.post("/trips/{trip_id}/arcs")
+def get_arcs(trip_id: int, req: ArcRequest):
+    """Lat/lon endpoints of the requested arcs (for drawing the matched route on Laptop 2)."""
+    root = DATA_TEST if (DATA_TEST / f"{trip_id:08d}").exists() else DATA_TRAIN
+    if not (root / f"{trip_id:08d}").exists():
+        raise HTTPException(status_code=404, detail=f"Trip {trip_id} not found")
+    trip = load_trip(root, trip_id)
+    nodes, arcs = trip["nodes"], trip["arcs"]  # nodes: lon, lat
+    out = []
+    for a in req.arc_ids:
+        if 0 <= a < len(arcs):
+            u, v = arcs[a]
+            out.append({
+                "arc_id": int(a),
+                "coords": [
+                    [float(nodes[u, 1]), float(nodes[u, 0])],
+                    [float(nodes[v, 1]), float(nodes[v, 0])],
+                ],
+            })
+    return {"trip_id": trip_id, "arcs": out}
 
 
 @app.get("/trips/{trip_id}/track")
