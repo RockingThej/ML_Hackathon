@@ -74,7 +74,7 @@ def get_arc_geometry(base, trip_id, arc_ids: tuple):
         pass
     try:
         from src.data.loaders import load_arcs, load_nodes
-        for part in ["student_test", "train"]:
+        for part in ["evaluator_test", "student_test", "train"]:
             root = ROOT / "data" / "raw" / part
             if (root / f"{trip_id:08d}").exists():
                 nodes, arcs = load_nodes(root, trip_id), load_arcs(root, trip_id)
@@ -89,7 +89,7 @@ def get_arc_geometry(base, trip_id, arc_ids: tuple):
 def build_map(track: pd.DataFrame, routes: dict, show_points: bool):
     """routes: {layer name: (colour, [[lat, lon], [lat, lon]] segments)}"""
     center = [track["lat"].mean(), track["lon"].mean()]
-    m = folium.Map(location=center, zoom_start=14, tiles="cartodbpositron", control_scale=True)
+    m = folium.Map(location=center, zoom_start=14, tiles="OpenStreetMap", control_scale=True)
     gps = folium.FeatureGroup("Raw GPS trace")
     folium.PolyLine(track[["lat", "lon"]].values.tolist(), color="#2a78d6", weight=2,
                     opacity=0.6, dash_array="4 4").add_to(gps)
@@ -142,8 +142,10 @@ with tab_match:
     else:
         trips = get_trips(api)
         c1, c2, c3 = st.columns([2, 1, 1])
-        group = c1.radio("Trip set", ["student_test", "train"], horizontal=True)
-        ids = trips.get(f"{group}_trips", [])
+        test_set = trips.get("test_set", "student_test")
+        test_ids = trips.get("test_trips", trips.get("student_test_trips", []))
+        group = c1.radio("Trip set", [test_set, "train"], horizontal=True)
+        ids = test_ids if group == test_set else trips.get("train_trips", [])
         trip_id = c2.selectbox("Trip ID", ids) if ids else None
         top_k = c3.slider("Candidates per point (K)", 5, 30, 15)
         o1, o2 = st.columns(2)
