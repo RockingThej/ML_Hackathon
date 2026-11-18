@@ -42,16 +42,27 @@ def build_emission_log_probs(features, sigma=20.0, heading_sigma=45.0):
     return emissions
 
 
+def build_emission_log_probs_from_model(features, model, K=15):
+    """Emission = log P(candidate is true arc), normalised over the point's K candidates."""
+    from src.features.candidates import FEATURES
+    f = features.sort_values(["point_idx", "dist_rank"])
+    p = model.predict_proba(f[FEATURES].to_numpy("float32"))[:, 1].reshape(-1, K)
+    p = np.clip(p, 1e-6, None)
+    p = p / p.sum(1, keepdims=True)
+    return list(np.log(p))
+
+
 def match_trip(root, trip_id, K=15, sigma=20.0,
-               heading_sigma=45.0, beta=50.0,
+               heading_sigma=45.0, beta=50.0, model=None,
                scores=None, emission_weight=1.0):
     """Perform HMM map matching for one trip.
 
-    scores : optional DataFrame from D's scores_<model>_test.parquet
-        (see src.hmm.ml_emissions.load_scores). If given, emissions are
-        log(point_prob) from the learned model instead of the hand-built
-        Gaussian distance/bearing model.
-    emission_weight : scales the ML log-emissions (tune on validation).
+    Emission source, in priority order:
+      1. scores : DataFrame from D's scores_<model>_test.parquet
+         (see src.hmm.ml_emissions.load_scores) -> log(point_prob)
+      2. model  : a loaded model with predict_proba, scored live
+      3. otherwise the hand-built Gaussian distance/bearing emissions.
+    emission_weight scales the `scores` log-emissions.
     """
 
     trip = load_trip(root, trip_id)
@@ -73,6 +84,8 @@ def match_trip(root, trip_id, K=15, sigma=20.0,
             features, scores, trip_id, weight=emission_weight,
             fallback=gaussian
         )
+    elif model is not None and hasattr(model, "predict_proba"):
+        emissions = build_emission_log_probs_from_model(features, model, K=K)
     else:
         emissions = build_emission_log_probs(
             features, sigma=sigma, heading_sigma=heading_sigma
