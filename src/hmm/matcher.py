@@ -1,4 +1,3 @@
-
 """HMM map matching for PathSnap."""
 
 import numpy as np
@@ -9,6 +8,7 @@ from src.features.candidates import build_features, prepare
 from src.route_reconstruction.road_graph import RoadGraph
 from src.hmm.viterbi import viterbi_decode_variable
 from src.hmm.transitions import build_transition_log_probs
+from src.hmm.ml_emissions import load_scores, build_emission_log_probs_ml
 
 
 def build_emission_log_probs(features, sigma=20.0, heading_sigma=45.0):
@@ -43,8 +43,16 @@ def build_emission_log_probs(features, sigma=20.0, heading_sigma=45.0):
 
 
 def match_trip(root, trip_id, K=15, sigma=20.0,
-               heading_sigma=45.0, beta=50.0):
-    """Perform HMM map matching for one trip."""
+               heading_sigma=45.0, beta=50.0,
+               scores=None, emission_weight=1.0):
+    """Perform HMM map matching for one trip.
+
+    scores : optional DataFrame from D's scores_<model>_test.parquet
+        (see src.hmm.ml_emissions.load_scores). If given, emissions are
+        log(point_prob) from the learned model instead of the hand-built
+        Gaussian distance/bearing model.
+    emission_weight : scales the ML log-emissions (tune on validation).
+    """
 
     trip = load_trip(root, trip_id)
 
@@ -57,9 +65,18 @@ def match_trip(root, trip_id, K=15, sigma=20.0,
     graph = RoadGraph(trip)
 
     print("Calculating emission probabilities...")
-    emissions = build_emission_log_probs(
-        features, sigma=sigma, heading_sigma=heading_sigma
-    )
+    if scores is not None:
+        gaussian = build_emission_log_probs(
+            features, sigma=sigma, heading_sigma=heading_sigma
+        )
+        emissions = build_emission_log_probs_ml(
+            features, scores, trip_id, weight=emission_weight,
+            fallback=gaussian
+        )
+    else:
+        emissions = build_emission_log_probs(
+            features, sigma=sigma, heading_sigma=heading_sigma
+        )
 
     print("Calculating transition probabilities...")
     transitions = build_transition_log_probs(
