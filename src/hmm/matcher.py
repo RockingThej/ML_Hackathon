@@ -42,8 +42,18 @@ def build_emission_log_probs(features, sigma=20.0, heading_sigma=45.0):
     return emissions
 
 
+def build_emission_log_probs_from_model(features, model, K=15):
+    """Emission = log P(candidate is true arc), normalised over the point's K candidates."""
+    from src.features.candidates import FEATURES
+    f = features.sort_values(["point_idx", "dist_rank"])
+    p = model.predict_proba(f[FEATURES].to_numpy("float32"))[:, 1].reshape(-1, K)
+    p = np.clip(p, 1e-6, None)
+    p = p / p.sum(1, keepdims=True)
+    return list(np.log(p))
+
+
 def match_trip(root, trip_id, K=15, sigma=20.0,
-               heading_sigma=45.0, beta=50.0):
+               heading_sigma=45.0, beta=50.0, model=None):
     """Perform HMM map matching for one trip."""
 
     trip = load_trip(root, trip_id)
@@ -57,9 +67,12 @@ def match_trip(root, trip_id, K=15, sigma=20.0,
     graph = RoadGraph(trip)
 
     print("Calculating emission probabilities...")
-    emissions = build_emission_log_probs(
-        features, sigma=sigma, heading_sigma=heading_sigma
-    )
+    if model is not None and hasattr(model, "predict_proba"):
+        emissions = build_emission_log_probs_from_model(features, model, K=K)
+    else:
+        emissions = build_emission_log_probs(
+            features, sigma=sigma, heading_sigma=heading_sigma
+        )
 
     print("Calculating transition probabilities...")
     transitions = build_transition_log_probs(

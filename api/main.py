@@ -266,7 +266,7 @@ def predict(req: PredictRequest):
     if req.use_hmm:
         try:
             from src.hmm.matcher import match_trip
-            result_df, _, _ = match_trip(str(trip_root), trip_id, K=req.top_k)
+            result_df, _, _ = match_trip(str(trip_root), trip_id, K=req.top_k, model=model)
             hmm_route = result_df["predicted_arc_id"].tolist()
             if has_route and "true_arc" in df_feats.attrs:
                 true_arcs = df_feats.attrs["true_arc"]
